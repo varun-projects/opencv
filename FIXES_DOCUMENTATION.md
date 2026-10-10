@@ -458,3 +458,278 @@ gitGraph
    commit id: "Add reshape() after getMat()"
    commit id: "Add regression test"
 ```
+
+---
+
+## Advanced Fixes — Object Detection & 3D Computer Vision
+
+---
+
+## Issue #29573 — solvePnPRansac Returns Wrong Inlier Set {#issue-29573}
+
+**Category:** 3D Computer Vision — Geometry  
+**Level:** Advanced  
+**File:** `modules/geometry/src/solvepnp.cpp`  
+**PR:** [#30229](https://github.com/opencv/opencv/pull/30229)  
+**Branch:** `fix/issue-29573-solvepnp-inliers`
+
+### Problem
+
+`solvePnPRansac` builds its output inlier list from `_mask_local_inliers`, which is the RANSAC *consensus* mask — set before the final `solvePnP` refinement step. After refinement the pose may shift enough that borderline points switch sides of the reprojection-error threshold, so the reported inliers do not correspond to the final returned pose.
+
+```mermaid
+flowchart TD
+    A[Input: opoints, ipoints] --> B[RANSAC → _mask_local_inliers + _local_model]
+    B --> C[Extract inlier subset\nopoints_inliers, ipoints_inliers]
+    C --> D[Final solvePnP refinement\n→ rvec, tvec]
+    D --> E{Build inlier output}
+    E -->|BUG: uses pre-refinement mask| F["_mask_local_inliers\n(hypothesis model)"]
+    E -->|FIX: reproject with final pose| G["projectPoints(opoints,\nrvec, tvec)\n→ recompute per-point error"]
+    F --> H[Wrong inliers returned]
+    G --> I[Correct inliers for final rvec/tvec]
+```
+
+### Code Diff
+
+**Before:**
+```cpp
+if(_inliers.needed())
+{
+    Mat _local_inliers;
+    for (int i = 0; i < npoints; ++i)
+    {
+        if((int)_mask_local_inliers.at<uchar>(i) != 0) // inliers mask
+            _local_inliers.push_back(i);    // output inliers vector
+    }
+    _local_inliers.copyTo(_inliers);
+}
+```
+
+**After:**
+```cpp
+if(_inliers.needed())
+{
+    // Recompute inliers based on the final refined pose, not the RANSAC consensus mask.
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(opoints.reshape(3, npoints), rvec, tvec, cameraMatrix, distCoeffs, projected);
+    Mat _local_inliers;
+    const float thresh2 = reprojectionError * reprojectionError;
+    for (int i = 0; i < npoints; ++i)
+    {
+        const cv::Point2f ip = ipoints.reshape(2, npoints).at<cv::Point2f>(i);
+        float dx = ip.x - projected[i].x;
+        float dy = ip.y - projected[i].y;
+        if (dx*dx + dy*dy <= thresh2)
+            _local_inliers.push_back(i);
+    }
+    _local_inliers.copyTo(_inliers);
+}
+```
+
+### PR Description
+
+> Fix `solvePnPRansac` inlier mask: use final pose instead of RANSAC consensus
+>
+> The inlier output was built from the RANSAC consensus mask set before the final
+> `solvePnP` refinement step. After refinement the pose can shift enough that
+> borderline points switch sides of the reprojection-error threshold.
+>
+> Fix: reproject all original object points with the final `rvec`/`tvec` and
+> rebuild the inlier list: a point is an inlier iff its reprojection error ≤
+> `reprojectionError`.
+>
+> Fixes #29573
+
+---
+
+## Issue #27714 — Memory Leak in Multithreaded ArUco Detection {#issue-27714}
+
+**Category:** Object Detection — ArUco  
+**Level:** Advanced  
+**File:** `modules/objdetect/src/aruco/apriltag/apriltag_quad_thresh.cpp`  
+**PR:** [#30230](https://github.com/opencv/opencv/pull/30230)  
+**Branch:** `fix/issue-27714-aruco-memory-leak`
+
+### Problem
+
+In `quad_segment_agg`, a `zmaxheap_t *heap` is created at function entry via `zmaxheap_create` (which `calloc`s the heap struct and its internal `values`/`data` buffers). When `zmaxheap_remove_max` returns zero (heap unexpectedly empty before `nvertices ≤ 4`), the function returns early without calling `zmaxheap_destroy(heap)`. The heap and its buffers are leaked on every such call.
+
+Under repeated multithreaded `ArucoDetector::detectMarkers` with `CORNER_REFINE_APRILTAG`, thousands of clusters per image × many threads × many iterations causes multi-GB RSS growth that never returns to the OS.
+
+```mermaid
+flowchart TD
+    A[quad_segment_agg called per cluster] --> B["heap = zmaxheap_create(...)"]
+    B --> C[Populate heap with sz vertices]
+    C --> D{while nvertices > 4}
+    D -->|yes| E["zmaxheap_remove_max(heap, ...)"]
+    E -->|res == 0| F["return 0  ← BUG: no zmaxheap_destroy!"]
+    E -->|res != 0| G[Process vertex, add children]
+    G --> D
+    D -->|no| H["zmaxheap_destroy(heap)  ← only called here"]
+    H --> I[return 1]
+    F -->|fix| J["zmaxheap_destroy(heap)\nthen return 0"]
+```
+
+### Code Diff
+
+**Before:**
+```cpp
+int res = zmaxheap_remove_max(heap, &rv, &err);
+if (!res)
+    return 0;
+CV_Assert(res);
+```
+
+**After:**
+```cpp
+int res = zmaxheap_remove_max(heap, &rv, &err);
+if (!res) {
+    zmaxheap_destroy(heap);
+    return 0;
+}
+CV_Assert(res);
+```
+
+### PR Description
+
+> Fix memory leak in ArUco `quad_segment_agg`: destroy zmaxheap on early exit
+>
+> In `quad_segment_agg`, a `zmaxheap_t *heap` is created at function start but
+> was not destroyed when `zmaxheap_remove_max` returned zero (heap unexpectedly
+> empty). This leaked the heap's `calloc`-allocated `values` and `data` buffers
+> on every such call. Under repeated multithreaded `detectMarkers` with
+> `CORNER_REFINE_APRILTAG`, accumulates to multi-GB RSS growth.
+>
+> Fix: call `zmaxheap_destroy(heap)` before the early return.
+>
+> Fixes #27714
+
+---
+
+## Issue #26498 — cv::flip Asserts on N-D Arrays (>512 Channels) {#issue-26498}
+
+**Category:** Core — Matrix Operations  
+**Level:** Advanced  
+**File:** `modules/core/src/matrix_transform.cpp`  
+**PR:** [#30228](https://github.com/opencv/opencv/pull/30228)  
+**Branch:** `fix/issue-26498-flip-ndim`
+
+### Problem
+
+`cv::flip` begins with `CV_Assert(_src.dims() <= 2)`. When a Python user passes a numpy array with shape `(H, W, C)` where `C > 512` (OpenCV's `CV_CN_MAX`), the Python bindings wrap it as a 3-D `Mat` (`dims() == 3`), causing the assertion to fail.
+
+`cv::flipND` already handles arbitrary-dimensional arrays. The fix routes the N-D case through it.
+
+```mermaid
+flowchart LR
+    A["cv::flip(src, dst, mode)"] --> B{src.dims() > 2?}
+    B -->|No - 2D path| C["Existing optimised path\nSIMD / OCL / HAL"]
+    B -->|Yes - NEW| D{flip_mode?}
+    D -->|0| E["flipND(src, dst, 0)\n(flip rows)"]
+    D -->|> 0| F["flipND(src, dst, 1)\n(flip cols)"]
+    D -->|< 0| G["flipND(src, tmp, 0)\nflipND(tmp, dst, 1)"]
+```
+
+### Code Diff
+
+**Before:**
+```cpp
+void flip( InputArray _src, OutputArray _dst, int flip_mode )
+{
+    CV_INSTRUMENT_REGION();
+
+    CV_Assert( _src.dims() <= 2 );
+    // ... rest of function
+```
+
+**After:**
+```cpp
+void flip( InputArray _src, OutputArray _dst, int flip_mode )
+{
+    CV_INSTRUMENT_REGION();
+
+    if( _src.dims() > 2 )
+    {
+        if (flip_mode == 0)
+        {
+            flipND(_src, _dst, 0);
+        }
+        else if (flip_mode > 0)
+        {
+            flipND(_src, _dst, 1);
+        }
+        else
+        {
+            Mat tmp;
+            flipND(_src, tmp, 0);
+            flipND(tmp, _dst, 1);
+        }
+        return;
+    }
+
+    CV_Assert( _src.dims() <= 2 );
+    // ... rest of function unchanged
+```
+
+### PR Description
+
+> Fix cv::flip assertion failure for N-D arrays (dims > 2)
+>
+> `cv::flip` rejected arrays with `dims() > 2` via `CV_Assert(_src.dims() <= 2)`.
+> NumPy arrays with more than `CV_CN_MAX` (~512) channels arrive as 3-D `Mat`
+> objects and always hit this assert.
+>
+> Route the N-D case through `cv::flipND` which already handles arbitrary
+> dimensionality. The existing 2-D optimised path (SIMD/OCL/HAL) is unchanged.
+>
+> Fixes #26498
+
+---
+
+## Updated PR Summary
+
+| PR | Issue | Level | Category | Branch | Files Changed |
+|----|-------|-------|----------|--------|---------------|
+| [#30223](https://github.com/opencv/opencv/pull/30223) | #29870 | Beginner | Docs | `fix/issue-29870-doc-add-example` | `py_image_arithmetics.markdown` |
+| [#30224](https://github.com/opencv/opencv/pull/30224) | #29818 | Beginner | Docs | `fix/issue-29818-opencv-js-link` | `js_usage.markdown` |
+| [#30225](https://github.com/opencv/opencv/pull/30225) | #29854 | Medium | imgproc | `fix/issue-29854-connectedcomponents-empty` | `connectedcomponents.cpp` + test |
+| [#30226](https://github.com/opencv/opencv/pull/30226) | #30164 | Medium | Object tracking | `fix/issue-30164-trackervit-scalefactor` | `tracker_vit.cpp` |
+| [#30227](https://github.com/opencv/opencv/pull/30227) | #29692 | Medium | 3D calib | `fix/issue-29692-fisheye-calibrate-shape` | `fisheye.cpp` + test |
+| [#30229](https://github.com/opencv/opencv/pull/30229) | #29573 | Advanced | 3D geometry | `fix/issue-29573-solvepnp-inliers` | `solvepnp.cpp` + test |
+| [#30230](https://github.com/opencv/opencv/pull/30230) | #27714 | Advanced | Object detection | `fix/issue-27714-aruco-memory-leak` | `apriltag_quad_thresh.cpp` + test |
+| [#30228](https://github.com/opencv/opencv/pull/30228) | #26498 | Advanced | Core | `fix/issue-26498-flip-ndim` | `matrix_transform.cpp` + test |
+
+### Updated Branch Overview
+
+```mermaid
+gitGraph
+   commit id: "5.x HEAD (1e21d6ed)"
+   branch fix/issue-29870-doc-add-example
+   commit id: "Fix 1D→2D array example"
+   checkout main
+   branch fix/issue-29818-opencv-js-link
+   commit id: "Fix 5.0.0→5.0 link"
+   checkout main
+   branch fix/issue-29854-connectedcomponents-empty
+   commit id: "Add CV_Assert(!img.empty())"
+   commit id: "Add regression test"
+   checkout main
+   branch fix/issue-30164-trackervit-scalefactor
+   commit id: "Replace quaternion with elementwise"
+   checkout main
+   branch fix/issue-29692-fisheye-calibrate-shape
+   commit id: "Add reshape() after getMat()"
+   commit id: "Add regression test"
+   checkout main
+   branch fix/issue-29573-solvepnp-inliers
+   commit id: "Recompute inliers from final pose"
+   commit id: "Add regression test"
+   checkout main
+   branch fix/issue-27714-aruco-memory-leak
+   commit id: "Destroy zmaxheap on early return"
+   commit id: "Add multithreaded regression test"
+   checkout main
+   branch fix/issue-26498-flip-ndim
+   commit id: "Route dims>2 through flipND"
+   commit id: "Add ndim regression test"
+```

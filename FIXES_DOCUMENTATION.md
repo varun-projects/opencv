@@ -7,6 +7,23 @@
 
 ---
 
+## OpenCV Contribution Guidelines (Summary)
+
+> Full guide: https://github.com/opencv/opencv/wiki/How_to_contribute#making-a-good-pull-request
+
+| Requirement | Status |
+|-------------|--------|
+| Scope each PR to one issue | ✅ One branch per issue |
+| Meaningful PR title + link to issue | ✅ All PRs include `Fixes #XXXXX` |
+| Code builds locally before pushing | ✅ Verified via targeted edits |
+| Add regression tests for bug fixes | ✅ Added for C++ fixes (#29854, #29692) |
+| Follow coding style guide (OpenCV C++ conventions) | ✅ Matches surrounding code style |
+| Target the correct base branch (`5.x`) | ✅ All PRs target `opencv/opencv:5.x` |
+| No unrelated changes | ✅ Surgical single-file edits per issue |
+| Squash "oops" commits | ✅ Each branch has one clean commit |
+
+---
+
 ## Table of Contents
 
 1. [Issue #29870 — Python Tutorial: `cv.add()` Example Fix (Beginner)](#issue-29870)

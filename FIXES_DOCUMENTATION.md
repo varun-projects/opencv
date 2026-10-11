@@ -707,6 +707,216 @@ TEST(Core_Flip, ndim_26498)
 
 ---
 
+## Issue #30151 — CV_64F GEMM Produces NaN on ARMv7 NEON
+
+**PR:** https://github.com/opencv/opencv/pull/30239  
+**Branch:** `fix/issue-30151-gemm-cv64f-armv7`  
+**Module:** `core`  
+**File:** `modules/core/src/matmul.simd.hpp`
+
+### Implementation Background
+
+OpenCV's GEMM (General Matrix Multiply) has three code paths: a SIMD-accelerated path (for float32 and, separately, float64), and a scalar fallback. On platforms where `CV_SIMD=1` but `CV_SIMD_64F=0` (notably 32-bit ARM / ARMv7 NEON), the float64 SIMD path was incorrectly compiled into the dispatch unit.
+
+The `simdGEMM_kj` helper was guarded by `#if (CV_SIMD || CV_SIMD_SCALABLE)`. This evaluates to **true** on ARMv7 NEON. But the body uses `VecTraits<double>` which only has a valid SIMD specialisation when `CV_SIMD_64F=1`. With `CV_SIMD_64F=0`, the float64 SIMD path silently degrades: the dispatch enters the SIMD block, but vector register operations on 64-bit floats fall back to bit-identical float32 register operations — causing **every output double to contain 0x7FC00000 (float32 quiet NaN) in its low 32 bits**.
+
+### Execution Flow (Before Fix)
+
+```mermaid
+flowchart TD
+    A[cv::gemm CV_64F input] --> B{CV_SIMD || CV_SIMD_SCALABLE?}
+    B -- ARMv7: TRUE --> C[Enter simdGEMM_kj]
+    C --> D{CV_SIMD_64F?}
+    D -- FALSE: no double vector ops --> E[simdDotProduct with float* cast of double*]
+    E --> F[NaN in output: 0x7FC00000 in low 32-bits]
+    B -- FALSE --> G[Correct scalar accumulator]
+    D -- TRUE --> H[Correct float64 SIMD path]
+```
+
+### Execution Flow (After Fix)
+
+```mermaid
+flowchart TD
+    A[cv::gemm CV_64F input] --> B{CV_SIMD_64F || CV_SIMD_SCALABLE_64F?}
+    B -- ARMv7: FALSE --> C[Correct scalar double accumulator]
+    B -- x86/AArch64: TRUE --> D[simdGEMM_kj with VecTraits<double>]
+    D --> E[Correct float64 SIMD result]
+```
+
+### Code Change
+
+```cpp
+// BEFORE (line 411 in matmul.simd.hpp):
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+template<typename WT> static void simdGEMM_kj(...)
+{
+    // Uses VecTraits<double> — only valid when CV_SIMD_64F=1
+}
+#endif
+
+// AFTER:
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+template<typename WT> static void simdGEMM_kj(...)
+{
+    // Now only compiled when float64 SIMD registers actually exist
+}
+#endif
+```
+
+### Regression Test
+
+`Core_GEMM.gemm_double_no_nan_30151` in `modules/core/test/test_mat.cpp`:
+- Input: 2×2 double-precision A, B with known integer values
+- Expected: A×B = [[19,22],[43,50]] (analytically exact)
+- Assertion: no NaN in any output element; all values within 1e-9 of expected
+
+### PR Description
+
+**Title:** `core: fix CV_64F GEMM NaN output on ARMv7 NEON (issue #30151)`
+
+On ARMv7 targets (`CV_SIMD=1`, `CV_SIMD_64F=0`), `cv::gemm` with double-precision matrices produced NaN in every output element. The `simdGEMM_kj` helper was compiled under `#if CV_SIMD`, but it uses `VecTraits<double>` which requires `CV_SIMD_64F`. Changing the guard to `#if CV_SIMD_64F || CV_SIMD_SCALABLE_64F` makes ARMv7 correctly use the scalar accumulator while 64-bit targets continue using the faster SIMD path.
+
+---
+
+## Issue #29893 — cv::multiply CV_16U Scalar Tail Saturates to 0
+
+**PR:** https://github.com/opencv/opencv/pull/30240  
+**Branch:** `fix/issue-29893-multiply-16u-saturation`  
+**Module:** `core`  
+**File:** `modules/core/src/arithm.simd.hpp`
+
+### Implementation Background
+
+OpenCV's element-wise multiply for `CV_16U` has a SIMD path (using `v_mul_sat` — integer widening multiply with saturation) and a scalar tail for the remaining elements. The scalar tail was parametrised with `float` as the work type (`WT`).
+
+The saturation bug arises from a chain of implicit conversions:
+1. `(float)src0[x] * (float)src1[x]` → float product (e.g., `4.294836225e9` for 65535²)
+2. `cvRound(float)` → converts to `int` (overflow: `4.29e9 > INT_MAX = 2.147e9` → wraps to negative)
+3. `saturate_cast<ushort>(negative_int)` → clamps to **0** (should be **65535**)
+
+This affected:
+- Arrays shorter than one SIMD width (32 on NEON/AVX2, 64 on AVX-512)
+- The final tail of any multiply call regardless of length
+
+### Data Flow (Before Fix)
+
+```mermaid
+flowchart TD
+    A[src0=65535, src1=65535] --> B["(float)a * (float)b = 4.29e9"]
+    B --> C["cvRound(float) → int"]
+    C --> D{"4.29e9 > INT_MAX?"}
+    D -- YES --> E["Signed overflow → negative int"]
+    E --> F["saturate_cast<ushort>(negative) → 0"]
+    F --> G["WRONG: output = 0"]
+    D -- NO --> H["saturate_cast<ushort>(int) → correct"]
+```
+
+### Data Flow (After Fix)
+
+```mermaid
+flowchart TD
+    A[src0=65535, src1=65535] --> B["(uint32_t)a * (uint32_t)b = 4,294,836,225"]
+    B --> C{"value > 65535?"}
+    C -- YES --> D["saturate_cast<ushort>(uint32_t) → 65535"]
+    D --> E["CORRECT: output = 65535"]
+    C -- NO --> F["saturate_cast<ushort>(uint32_t) → exact value"]
+```
+
+### Code Change
+
+```cpp
+// BEFORE: getMulFunc_ for CV_16U → CV_16U
+// Work type WT = float → overflow for large ushort products
+getMulFunc_<ushort, ushort, float>(...)
+
+// AFTER: Work type WT = uint32_t
+getMulFunc_<ushort, ushort, uint32_t>(...)
+// uint32_t holds 65535² = 4,294,836,225 < UINT32_MAX (4,294,967,295)
+// saturate_cast<ushort>(uint32_t) uses min(v, 65535) — always correct
+```
+
+### Regression Test
+
+`Core_Multiply.multiply_16u_saturation_29893` in `modules/core/test/test_arithm.cpp`:
+- Input: two 1×3 `CV_16UC1` matrices filled with 65535 (width 3 < any SIMD width)
+- Expected: all output pixels = 65535 (not 0)
+- Also tests in-place multiply with the same expected result
+
+### PR Description
+
+**Title:** `core: fix cv::multiply CV_16U scalar tail saturating to 0 instead of 65535 (issue #29893)`
+
+The 16U element-wise multiply scalar tail used `float` as the intermediate type. `65535 × 65535 = 4,294,836,225 > INT_MAX`, so `cvRound(float) → int` wrapped to negative, and `saturate_cast<ushort>(negative)` produced 0 instead of 65535. Fix: change the work type to `uint32_t`, which holds the product without overflow and lets `saturate_cast<ushort>` correctly saturate to 65535.
+
+---
+
+## Issue #29985 — cv::resize INTER_LINEAR Backend Inconsistency (fx/fy Path)
+
+**PR:** https://github.com/opencv/opencv/pull/30238  
+**Branch:** `fix/issue-29985-resize-scale-recompute`  
+**Module:** `imgproc`  
+**File:** `modules/imgproc/src/resize.cpp`
+
+### Implementation Background
+
+`cv::resize` supports two calling conventions:
+1. **Explicit dsize**: output size is known; `inv_scale = dsize / src_size` is computed immediately.
+2. **fx/fy scale factors**: output size is `round(src_size * inv_scale_from_fx_fy)`.
+
+In convention 2, after rounding, the realized scale ratio (`rounded_dsize / src_size`) differs from the nominal `1/fx` — e.g., `round(55 × 0.5) = 28`, but `28/55 ≈ 0.509 ≠ 0.5`. The old code stored `inv_scale_x = 1/fx` and never updated it. All downstream kernels (scalar CPU, OpenCL, HAL) received the **nominal** scale, while KleidiCV derived the **realized** scale from `dst/src` directly — producing different sample coordinates for the last few output pixels (max diff ~104 per pixel).
+
+The `dsize`-provided branch already computed the realized scale correctly. The `fx/fy` branch simply forgot to update `inv_scale` after rounding.
+
+### Execution Flow
+
+```mermaid
+flowchart TD
+    A[cv::resize called with fx=0.5] --> B{"dsize empty?"}
+    B -- YES --> C["dsize = round(src_size × 1/fx)"]
+    C --> D_old["OLD: inv_scale stays = 1/fx (nominal)"]
+    C --> D_new["NEW: recompute inv_scale = dsize / src_size (realized)"]
+    D_old --> E_old["Kernels use nominal scale → inconsistency with KleidiCV"]
+    D_new --> E_new["All kernels use realized scale → consistent output"]
+    B -- NO --> F["inv_scale = dsize / src_size (always correct)"]
+    F --> E_new
+```
+
+### Code Change
+
+```cpp
+// modules/imgproc/src/resize.cpp (~line 3591)
+if( dsize.empty() )
+{
+    dsize = Size(saturate_cast<int>(ssize.width*inv_scale_x),
+                 saturate_cast<int>(ssize.height*inv_scale_y));
+    CV_Assert( !dsize.empty() );
++   // Recompute realized scale after rounding so all backends are consistent
++   inv_scale_x = (double)dsize.width / ssize.width;
++   inv_scale_y = (double)dsize.height / ssize.height;
+}
+else
+{
+    inv_scale_x = (double)dsize.width / ssize.width;  // was already correct
+    inv_scale_y = (double)dsize.height / ssize.height;
+}
+```
+
+### Regression Test
+
+`Imgproc_Resize.scale_recomputed_from_dsize_29985` in `modules/imgproc/test/test_imgwarp.cpp`:
+- Source: 1×55 ramp image; `fx=0.5` → `dsize.width=28` (realized scale ≠ nominal)
+- Compare: `resize(src, dst, Size(), 0.5, 1.0)` vs `resize(src, dst, Size(28,1))`
+- Expected: pixel-for-pixel identical (max diff ≤ 1)
+
+### PR Description
+
+**Title:** `imgproc: fix resize() scale inconsistency when dsize derived from fx/fy (issue #29985)`
+
+When `cv::resize` is called with scale factors and empty `dsize`, the rounded output size and the nominal `1/fx` scale diverge. The fix adds two lines to recompute `inv_scale_x/y` from the rounded `dsize` (identical to the logic already present in the explicit-`dsize` branch), making all backends consistent.
+
+---
+
+
 ## Summary of All PRs {#summary}
 
 | PR | Issue | Level | Category | Root Cause | Fix Strategy |
@@ -719,6 +929,9 @@ TEST(Core_Flip, ndim_26498)
 | [#30229](https://github.com/opencv/opencv/pull/30229) | #29573 | Advanced | 3D geometry | Inlier list from RANSAC hypothesis, not final pose | Reproject with final `rvec`/`tvec` |
 | [#30230](https://github.com/opencv/opencv/pull/30230) | #27714 | Advanced | Object detection | `zmaxheap_destroy` missing on early return | Destroy heap before `return 0` |
 | [#30228](https://github.com/opencv/opencv/pull/30228) | #26498 | Advanced | Core | `CV_Assert(dims<=2)` rejects N-D arrays | Delegate to `flipND` for `dims>2` |
+| [#30239](https://github.com/opencv/opencv/pull/30239) | #30151 | Advanced | Core | GEMM CV_64F NaN on ARMv7 NEON | Guard `simdGEMM_kj` with `CV_SIMD_64F` |
+| [#30240](https://github.com/opencv/opencv/pull/30240) | #29893 | Advanced | Core | multiply 16U scalar tail saturates to 0 | Use `uint32_t` WT instead of `float` |
+| [#30238](https://github.com/opencv/opencv/pull/30238) | #29985 | Advanced | imgproc | resize OCL/CPU scale inconsistency | Recompute `inv_scale` after rounding |
 
 ### Branch Overview
 
